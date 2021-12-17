@@ -1152,35 +1152,12 @@ namespace std::execution {
           }
         };
 
-      template <template <class...> class, class, class...>
-        __types<exception_ptr> __test();
-
-      // The requirement here could cause a recursive instantiation of
-      // sender_traits, in which case the first __test overload should be
-      // selected. (BUGBUG is this required by the standard?)
-      template <template <class...> class, class _Receiver, class... _Ts>
-        __types<> __test() requires nothrow_receiver_of<_Receiver, _Ts...>;
-
-      template <class _Receiver, class... _Ts>
-        struct __value_traits {
-          template <template <class...> class _Tuple, template <class...> class _Variant>
-            using value_types = _Variant<_Tuple<_Ts...>>;
-
-          template <template <class...> class _Variant>
-            using error_types =
-              __mapply<
-                __q<_Variant>,
-                decltype(__impl::__test<_Variant, _Receiver, _Ts...>())>;
-
-          static constexpr bool sends_done = false;
-        };
-
       template <class _Tag, class... _Ts, class _Receiver>
       receiver_signatures<_Tag(_Ts...)>
       tag_invoke(get_sender_traits_t, const __sender<_Tag, _Ts...>&, _Receiver&&) noexcept;
 
       template <class... _Ts, class _Receiver>
-      __value_traits<_Receiver, _Ts...>
+      receiver_signatures<set_value_t(_Ts...), set_error_t(exception_ptr)>
       tag_invoke(get_sender_traits_t, const __sender<set_value_t, _Ts...>&, _Receiver&&) noexcept;
     } // namespace __impl
 
@@ -2479,6 +2456,113 @@ namespace std::execution {
             };
         };
 
+      template <class _SchedulerId, class _CvrefSenderId, class _ReceiverId>
+        struct __operation1;
+
+      template <class _SchedulerId, class _CvrefSenderId, class _ReceiverId>
+        struct __receiver1;
+
+      // This receiver is to be completed on the execution context
+      // associated with the scheduler. When the source sender
+      // completes, the completion information is saved off in the
+      // operation state so that when this receiver completes, it can
+      // read the completion out of the operation state and forward it
+      // to the output receiver after transitioning to the scheduler's
+      // context.
+      template <class _SchedulerId, class _CvrefSenderId, class _ReceiverId>
+        struct __receiver2 {
+          using _Receiver = __t<_ReceiverId>;
+          __operation1<_SchedulerId, _CvrefSenderId, _ReceiverId>* __op_state_;
+
+          // If the work is successfully scheduled on the new execution
+          // context and is ready to run, forward the completion signal in
+          // the operation state
+          friend void tag_invoke(set_value_t, __receiver2&& __self) noexcept {
+            __self.__op_state_->__data_.complete(__self.__op_state_->__rcvr_);
+          }
+
+          template <__one_of<set_error_t, set_done_t> _Tag, class... _Args>
+            requires invocable<_Tag, _Receiver, _Args...>
+          friend void tag_invoke(_Tag, __receiver2&& __self, _Args&&... __args) noexcept {
+            _Tag{}((_Receiver&&) __self.__op_state_->__rcvr_, (_Args&&) __args...);
+          }
+
+          template <__receiver_query _Tag, class... _Args>
+            requires invocable<_Tag, const _Receiver&, _Args...>
+          friend decltype(auto) tag_invoke(_Tag tag, const __receiver2& __self, _Args&&... __args)
+            noexcept(is_nothrow_invocable_v<_Tag, const _Receiver&, _Args...>) {
+            return ((_Tag&&) tag)(as_const(__self.__op_state_->__rcvr_), (_Args&&) __args...);
+          }
+        };
+
+      // This receiver is connected to the input sender. When that
+      // sender completes (on whatever context it completes on), save
+      // the completion information into the operation state. Then,
+      // schedule a second operation to complete on the execution
+      // context of the scheduler. That second receiver will read the
+      // completion information out of the operation state and propagate
+      // it to the output receiver from within the desired context.
+      template <class _SchedulerId, class _CvrefSenderId, class _ReceiverId>
+        struct __receiver1 {
+          using _CvrefSender = __t<_CvrefSenderId>;
+          using _Receiver = __t<_ReceiverId>;
+          using __receiver2_t =
+            __receiver2<_SchedulerId, _CvrefSenderId, _ReceiverId>;
+          __operation1<_SchedulerId, _CvrefSenderId, _ReceiverId>* __op_state_;
+
+          template <__one_of<set_value_t, set_error_t, set_done_t> _Tag, class... _Args>
+            requires invocable<_Tag, _Receiver, _Args...>
+          friend void tag_invoke(_Tag, __receiver1&& __self, _Args&&... __args) noexcept try {
+            // Write the tag and the args into the operation state so that
+            // we can forward the completion from within the scheduler's
+            // execution context.
+            __self.__op_state_->__data_.template emplace<__decayed_tuple<_Tag, _Args...>>(_Tag{}, (_Args&&) __args...);
+            // Schedule the completion to happen on the scheduler's
+            // execution context.
+            __self.__op_state_->__state2_.emplace(
+                __conv{[__op_state = __self.__op_state_] {
+                  return connect(schedule(__op_state->__sched_), __receiver2_t{__op_state});
+                }});
+            // Enqueue the scheduled operation:
+            start(*__self.__op_state_->__state2_);
+          } catch(...) {
+            set_error((_Receiver&&) __self.__op_state_->__rcvr_, current_exception());
+          }
+
+          template <__receiver_query _Tag, class... _Args>
+            requires invocable<_Tag, const _Receiver&, _Args...>
+          friend decltype(auto) tag_invoke(_Tag tag, const __receiver1& __self, _Args&&... __args)
+            noexcept(is_nothrow_invocable_v<_Tag, const _Receiver&, _Args...>) {
+            return ((_Tag&&) tag)(as_const(__self.__op_state_->__rcvr_), (_Args&&) __args...);
+          }
+        };
+
+      template <class _SchedulerId, class _CvrefSenderId, class _ReceiverId>
+        struct __operation1 {
+          using _Scheduler = __t<_SchedulerId>;
+          using _CvrefSender = __t<_CvrefSenderId>;
+          using _Receiver = __t<_ReceiverId>;
+          using __receiver1_t =
+            __receiver1<_SchedulerId, _CvrefSenderId, _ReceiverId>;
+          using __receiver2_t =
+            __receiver2<_SchedulerId, _CvrefSenderId, _ReceiverId>;
+
+          _Scheduler __sched_;
+          _Receiver __rcvr_;
+          __minvoke<__completion_storage<_CvrefSender, __receiver1_t>, _Receiver> __data_;
+          connect_result_t<_CvrefSender, __receiver1_t> __state1_;
+          optional<connect_result_t<schedule_result_t<_Scheduler>, __receiver2_t>> __state2_;
+
+          __operation1(_Scheduler __sched, _CvrefSender&& __sndr, __decays_to<_Receiver> auto&& __rcvr)
+            : __sched_(__sched)
+            , __rcvr_((decltype(__rcvr)&&) __rcvr)
+            , __state1_(connect((_CvrefSender&&) __sndr, __receiver1_t{this})) {}
+
+          friend void tag_invoke(start_t, __operation1& __op_state) noexcept {
+            start(__op_state.__state1_);
+          }
+        };
+
       template <class _SchedulerId, class _SenderId>
         struct __sender {
           using _Scheduler = __t<_SchedulerId>;
@@ -2486,102 +2570,10 @@ namespace std::execution {
           _Scheduler __sched_;
           _Sender __sndr_;
 
-          template <class _CvrefReceiver_>
-            struct __operation1 {
-              // Bit of a hack here: the cvref qualification of the _Sender
-              // is encoded in the type of the _Receiver:
-              using _CvrefReceiver = __t<_CvrefReceiver_>;
-              using _CvrefSender = __member_t<_CvrefReceiver, _Sender>;
-              using _Receiver = decay_t<_CvrefReceiver>;
-
-              // This receiver is to be completed on the execution context
-              // associated with the scheduler. When the source sender
-              // completes, the completion information is saved off in the
-              // operation state so that when this receiver completes, it can
-              // read the completion out of the operation state and forward it
-              // to the output receiver after transitioning to the scheduler's
-              // context.
-              struct __receiver2 {
-                __operation1* __op_state_;
-
-                // If the work is successfully scheduled on the new execution
-                // context and is ready to run, forward the completion signal in
-                // the operation state
-                friend void tag_invoke(set_value_t, __receiver2&& __self) noexcept {
-                  __self.__op_state_->__data_.complete(__self.__op_state_->__rcvr_);
-                }
-
-                template <__one_of<set_error_t, set_done_t> _Tag, class... _Args>
-                  requires invocable<_Tag, _Receiver, _Args...>
-                friend void tag_invoke(_Tag, __receiver2&& __self, _Args&&... __args) noexcept {
-                  _Tag{}((_Receiver&&) __self.__op_state_->__rcvr_, (_Args&&) __args...);
-                }
-
-                template <__receiver_query _Tag, class... _Args>
-                  requires invocable<_Tag, const _Receiver&, _Args...>
-                friend decltype(auto) tag_invoke(_Tag tag, const __receiver2& __self, _Args&&... __args)
-                  noexcept(is_nothrow_invocable_v<_Tag, const _Receiver&, _Args...>) {
-                  return ((_Tag&&) tag)(as_const(__self.__op_state_->__rcvr_), (_Args&&) __args...);
-                }
-              };
-
-              // This receiver is connected to the input sender. When that
-              // sender completes (on whatever context it completes on), save
-              // the completion information into the operation state. Then,
-              // schedule a second operation to complete on the execution
-              // context of the scheduler. That second receiver will read the
-              // completion information out of the operation state and propagate
-              // it to the output receiver from within the desired context.
-              struct __receiver1 {
-                __operation1* __op_state_;
-
-                template <__one_of<set_value_t, set_error_t, set_done_t> _Tag, class... _Args>
-                  requires invocable<_Tag, _Receiver, _Args...>
-                friend void tag_invoke(_Tag, __receiver1&& __self, _Args&&... __args) noexcept try {
-                  // Write the tag and the args into the operation state so that
-                  // we can forward the completion from within the scheduler's
-                  // execution context.
-                  __self.__op_state_->__data_.template emplace<__decayed_tuple<_Tag, _Args...>>(_Tag{}, (_Args&&) __args...);
-                  // Schedule the completion to happen on the scheduler's
-                  // execution context.
-                  __self.__op_state_->__state2_.emplace(
-                      __conv{[__op_state = __self.__op_state_] {
-                        return connect(schedule(__op_state->__sched_), __receiver2{__op_state});
-                      }});
-                  // Enqueue the scheduled operation:
-                  start(*__self.__op_state_->__state2_);
-                } catch(...) {
-                  set_error((_Receiver&&) __self.__op_state_->__rcvr_, current_exception());
-                }
-
-                template <__receiver_query _Tag, class... _Args>
-                  requires invocable<_Tag, const _Receiver&, _Args...>
-                friend decltype(auto) tag_invoke(_Tag tag, const __receiver1& __self, _Args&&... __args)
-                  noexcept(is_nothrow_invocable_v<_Tag, const _Receiver&, _Args...>) {
-                  return ((_Tag&&) tag)(as_const(__self.__op_state_->__rcvr_), (_Args&&) __args...);
-                }
-              };
-
-              _Scheduler __sched_;
-              _Receiver __rcvr_;
-              __minvoke<__completion_storage<_CvrefSender, __receiver1>, _Receiver> __data_;
-              connect_result_t<_CvrefSender, __receiver1> __state1_;
-              optional<connect_result_t<schedule_result_t<_Scheduler>, __receiver2>> __state2_;
-
-              __operation1(_Scheduler __sched, _CvrefSender&& __sndr, __decays_to<_Receiver> auto&& __rcvr)
-                : __sched_(__sched)
-                , __rcvr_((decltype(__rcvr)&&) __rcvr)
-                , __state1_(connect((_CvrefSender&&) __sndr, __receiver1{this})) {}
-
-              friend void tag_invoke(start_t, __operation1& __op_state) noexcept {
-                start(__op_state.__state1_);
-              }
-            };
-
           template <__decays_to<__sender> _Self, receiver _Receiver>
             requires sender_to<__member_t<_Self, _Sender>, _Receiver>
           friend auto tag_invoke(connect_t, _Self&& __self, _Receiver&& __rcvr)
-              -> __operation1<__x<__member_t<_Self, decay_t<_Receiver>>>> {
+              -> __operation1<_SchedulerId, __x<__member_t<_Self, _Sender>>, __x<decay_t<_Receiver>>> {
             return {__self.__sched_, ((_Self&&) __self).__sndr_, (_Receiver&&) __rcvr};
           }
 
@@ -2597,9 +2589,13 @@ namespace std::execution {
             return ((_Tag&&) __tag)(__self.__sndr_, (_As&&) __as...);
           }
 
-          template <class _Receiver>
-          friend constexpr auto tag_invoke(get_sender_traits_t, const __sender&, _Receiver&&) noexcept
-              -> invoke_result_t<get_sender_traits_t, const _Sender&, _Receiver> {
+          template <class _Self, class _Receiver>
+            using __receiver1_t =
+              __receiver1<_SchedulerId, __x<__member_t<_Self, _Sender>>, __x<decay_t<_Receiver>>>;
+
+          template <__decays_to<__sender> _Self, class _Receiver>
+          friend constexpr auto tag_invoke(get_sender_traits_t, _Self&&, _Receiver&&) noexcept
+              -> sender_traits<__member_t<_Self, _Sender>, __receiver1_t<_Self, _Receiver>> {
             return {};
           }
         };
@@ -3302,6 +3298,48 @@ namespace std::execution {
       }
     } transfer_when_all_with_variant {};
   } // namespace __when_all
+
+  inline namespace __read_ {
+    namespace __impl {
+      template <class _Tag, class _ReceiverId>
+        struct __operation {
+          __t<_ReceiverId> __rcvr_;
+          friend void tag_invoke(start_t, __operation& __self) noexcept try {
+            set_value(std::move(__self.__rcvr_), _Tag{}(std::as_const(__self.__rcvr_)));
+          } catch(...) {
+            set_error(std::move(__self.__rcvr_), current_exception());
+          }
+        };
+
+      template <class _Tag>
+        struct __sender {
+          template <class _Receiver>
+            requires invocable<_Tag, __cref_t<_Receiver>> &&
+              receiver_of<_Receiver, invoke_result_t<_Tag, __cref_t<_Receiver>>>
+          friend auto tag_invoke(connect_t, __sender, _Receiver&& __rcvr)
+            noexcept(is_nothrow_constructible_v<decay_t<_Receiver>, _Receiver>)
+            -> __operation<_Tag, __x<decay_t<_Receiver>>> {
+            return {(_Receiver&&) __rcvr};
+          }
+
+          friend __ tag_invoke(get_sender_traits_t, __sender, auto&&) noexcept;
+
+          template <class _Receiver>
+            requires invocable<_Tag, __cref_t<_Receiver>>
+          friend auto tag_invoke(get_sender_traits_t, __sender, _Receiver&&) noexcept
+            -> receiver_signatures<
+                set_value_t(invoke_result_t<_Tag, __cref_t<_Receiver>>),
+                set_error_t(exception_ptr)>;
+        };
+    } // namespace __impl
+
+    inline constexpr struct __read_t {
+      template <class _Tag>
+      constexpr __impl::__sender<_Tag> operator()(_Tag) const noexcept {
+        return {};
+      }
+    } __read {};
+  } // namespace __read_
 } // namespace std::execution
 
 namespace std::this_thread {
@@ -3355,7 +3393,7 @@ namespace std::this_thread {
           }
           friend execution::run_loop::__scheduler
           tag_invoke(execution::get_scheduler_t, const __receiver& __rcvr) noexcept {
-            return __rcvr.__loop_.get_scheduler();
+            return __rcvr.__loop_->get_scheduler();
           }
         };
 
